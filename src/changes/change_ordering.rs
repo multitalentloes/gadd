@@ -74,6 +74,13 @@ impl ChangeOrdering {
         }
     }
 
+    pub fn remember_current_order(&mut self, changes: &[Change]) {
+        self.map.clear();
+        for (index, change) in changes.iter().enumerate() {
+            self.map.insert(change.path.clone(), index);
+        }
+    }
+
     fn compare_paths(path_1: &[u8], path_2: &[u8]) -> Ordering {
         let name_1 = String::from_utf8_lossy(path_1);
         let name_2 = String::from_utf8_lossy(path_2);

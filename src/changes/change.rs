@@ -88,14 +88,14 @@ impl Change {
 
 /// From git2 crate: https://docs.rs/git2/0.17.1/src/git2/util.rs.html#86
 #[cfg(unix)]
-fn bytes_to_path(bytes: &[u8]) -> &Path {
+pub(crate) fn bytes_to_path(bytes: &[u8]) -> &Path {
     use std::{ffi::OsStr, os::unix::prelude::*};
     Path::new(OsStr::from_bytes(bytes))
 }
 
 /// From git2 crate: https://docs.rs/git2/0.17.1/src/git2/util.rs.html#91
 #[cfg(windows)]
-fn bytes_to_path(bytes: &[u8]) -> &Path {
+pub(crate) fn bytes_to_path(bytes: &[u8]) -> &Path {
     Path::new(std::str::from_utf8(bytes).unwrap())
 }
 

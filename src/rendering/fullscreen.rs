@@ -2,6 +2,7 @@ use std::io::Write;
 
 use super::status_symbols::{get_status_symbols, StatusSymbol};
 use crate::event_loop::DisplayedError;
+use crate::statuses::Status;
 use crate::{
     changes::{branches::FetchStatus, change::Change, change_list::ChangeList},
     Stdout,
@@ -57,7 +58,6 @@ impl FullscreenRenderer<'_> {
         error_to_display: Option<&DisplayedError>,
     ) -> Result<()> {
         self.update_list_widget_state(change_list);
-
         self.terminal
             .draw(|frame| {
                 let main_layout = Layout::default()
@@ -75,14 +75,6 @@ impl FullscreenRenderer<'_> {
                         );
                     }
                     RenderMode::HelpScreen => {
-                        if let Some(error) = error_to_display {
-                            let (error_widget, size) = Self::new_error_widget(error);
-                            let error_area =
-                                frame.area().resize(Size::new(frame.area().width, size + 2));
-                            frame.render_widget(Clear, error_area);
-                            frame.render_widget(error_widget, error_area);
-                        }
-
                         let (help_screen, size) = Self::new_help_screen_widget();
                         let help_screen_layout = Layout::default()
                             .direction(Direction::Vertical)
@@ -92,20 +84,36 @@ impl FullscreenRenderer<'_> {
                     }
                 };
 
+                if let Some(error) = error_to_display {
+                    let (error_widget, size) = Self::new_error_widget(error);
+                    let error_area = frame.area().resize(Size::new(frame.area().width, size + 2));
+                    frame.render_widget(Clear, error_area);
+                    frame.render_widget(error_widget, error_area);
+                }
+
                 let (shortcut_widget, shortcut_size) = match self.mode {
                     RenderMode::ChangeList => Self::new_help_shortcut_widget(),
                     RenderMode::HelpScreen => Self::new_back_shortcut_widget(),
                 };
 
+                let progress_widget = Self::new_stage_progress_widget(change_list);
+                let progress_size = progress_widget.as_ref().map_or(0, |(_, size)| *size);
+                let (branch_widget, branch_size) = Self::new_branch_status_widget(change_list);
                 let bottom_bar_layout = Layout::default()
                     .direction(Direction::Horizontal)
-                    .constraints([Constraint::Min(1), Constraint::Length(shortcut_size)])
+                    .constraints([
+                        Constraint::Length(branch_size),
+                        Constraint::Length(progress_size),
+                        Constraint::Min(1),
+                        Constraint::Length(shortcut_size),
+                    ])
                     .split(main_layout[1]);
 
-                let branch_status = Self::new_branch_status_widget(change_list);
-                frame.render_widget(branch_status, bottom_bar_layout[0]);
-
-                frame.render_widget(shortcut_widget, bottom_bar_layout[1])
+                frame.render_widget(branch_widget, bottom_bar_layout[0]);
+                if let Some((progress_widget, _)) = progress_widget {
+                    frame.render_widget(progress_widget, bottom_bar_layout[1]);
+                }
+                frame.render_widget(shortcut_widget, bottom_bar_layout[3])
             })
             .context("Failed to draw to terminal")?;
 
@@ -129,22 +137,44 @@ impl FullscreenRenderer<'_> {
 
         for (i, change) in change_list.changes.iter().enumerate().rev() {
             let is_selected = i == change_list.index_of_selected_change;
-            let list_item = Self::list_item_widget_from_change(change, is_selected);
+            let list_item = Self::list_item_widget_from_change(
+                change,
+                is_selected,
+                change_list.is_pending_stage(&change.path),
+                change_list.is_completed_stage(&change.path),
+            );
             list_items.push(list_item);
         }
 
         List::new(list_items).direction(ListDirection::BottomToTop)
     }
 
-    fn list_item_widget_from_change(change: &Change, is_selected: bool) -> ListItem<'_> {
+    fn list_item_widget_from_change(
+        change: &Change,
+        is_selected: bool,
+        is_pending: bool,
+        is_completed: bool,
+    ) -> ListItem<'_> {
         let mut line = Vec::<Span>::new();
 
-        for status_symbol in get_status_symbols(&change.status) {
-            line.push(match status_symbol {
-                StatusSymbol::Green(symbol) => Span::styled(symbol, GREEN_TEXT),
-                StatusSymbol::Red(symbol) => Span::styled(symbol, RED_TEXT),
-                StatusSymbol::Space => Span::raw(" "),
-            });
+        if is_pending {
+            line.push(Span::styled("..", YELLOW_TEXT));
+        } else {
+            let staged_new = Status::NonConflicting(git2::Status::INDEX_NEW);
+            let display_status = if is_completed
+                && matches!(change.status, Status::NonConflicting(status) if status.is_wt_new())
+            {
+                &staged_new
+            } else {
+                &change.status
+            };
+            for status_symbol in get_status_symbols(display_status) {
+                line.push(match status_symbol {
+                    StatusSymbol::Green(symbol) => Span::styled(symbol, GREEN_TEXT),
+                    StatusSymbol::Red(symbol) => Span::styled(symbol, RED_TEXT),
+                    StatusSymbol::Space => Span::raw(" "),
+                });
+            }
         }
 
         line.push(Span::raw(" "));
@@ -162,7 +192,7 @@ impl FullscreenRenderer<'_> {
         ListItem::new(Line::from(line))
     }
 
-    fn new_branch_status_widget<'a>(change_list: &'a ChangeList) -> Block<'a> {
+    fn new_branch_status_widget<'a>(change_list: &'a ChangeList) -> (Block<'a>, u16) {
         let mut line = Vec::<Span>::new();
 
         line.push(Span::styled("##", GRAY_TEXT));
@@ -202,7 +232,35 @@ impl FullscreenRenderer<'_> {
             }
         }
 
-        Block::default().title(Line::from(line))
+        let title = Line::from(line);
+        let width = (title.width() + 1).min(u16::MAX as usize) as u16;
+        (Block::default().title(title), width)
+    }
+
+    /// Returns a compact one-row progress display and its width.
+    fn new_stage_progress_widget(change_list: &ChangeList) -> Option<(Paragraph<'static>, u16)> {
+        let (completed, total) = change_list.stage_progress()?;
+        let line = if let Some(total) = total {
+            const BAR_WIDTH: usize = 10;
+            let count_width = total.to_string().len();
+            let filled = completed
+                .saturating_mul(BAR_WIDTH)
+                .checked_div(total)
+                .unwrap_or(0)
+                .min(BAR_WIDTH);
+            Line::from(vec![
+                Span::raw(" Staging "),
+                Span::styled("█".repeat(filled), YELLOW_TEXT),
+                Span::styled("░".repeat(BAR_WIDTH - filled), GRAY_TEXT),
+                Span::raw(" "),
+                Span::raw(format!("{completed:>count_width$}/{total}")),
+                Span::raw(" "),
+            ])
+        } else {
+            Line::raw(" Staging: scanning... ")
+        };
+        let width = line.width().min(u16::MAX as usize) as u16;
+        Some((Paragraph::new(line), width))
     }
 
     /// Returns (widget, size).
@@ -314,6 +372,11 @@ const RED_TEXT: Style = Style {
 
 const GREEN_TEXT: Style = Style {
     fg: Some(Color::Green),
+    ..EMPTY_STYLE
+};
+
+const YELLOW_TEXT: Style = Style {
+    fg: Some(Color::Yellow),
     ..EMPTY_STYLE
 };
 

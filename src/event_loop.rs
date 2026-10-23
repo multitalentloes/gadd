@@ -15,11 +15,14 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-enum Event {
+use crate::staging::{spawn_stage_thread, StageEvent, StageScope};
+
+pub(crate) enum Event {
     UserInput(KeyEvent),
     UserInputError(Error),
     FetchComplete(UpstreamCommitsDiff),
     FetchError(Error),
+    Stage(StageEvent),
 }
 
 enum Signal {
@@ -44,7 +47,7 @@ pub(crate) fn run_event_loop(
     spawn_input_thread(event_sender.clone(), input_signal_receiver);
     spawn_fetch_thread(
         change_list.current_branch.clone(),
-        event_sender,
+        event_sender.clone(),
         fetch_signal_receiver,
     );
 
@@ -66,6 +69,7 @@ pub(crate) fn run_event_loop(
                     change_list,
                     renderer,
                     fetch_signal_sender.clone(),
+                    event_sender.clone(),
                     error_to_display.as_ref(),
                     config,
                 ) {
@@ -115,6 +119,29 @@ pub(crate) fn run_event_loop(
                     renderer.render(change_list, error_to_display.as_ref())?;
                 }
             }
+            Event::Stage(StageEvent::Discovered(paths)) => {
+                change_list.expand_staging_paths(paths);
+                renderer.render(change_list, error_to_display.as_ref())?;
+            }
+            Event::Stage(StageEvent::BatchWritten(paths)) => {
+                change_list.complete_staging_batch(paths);
+                renderer.render(change_list, error_to_display.as_ref())?;
+            }
+            Event::Stage(StageEvent::Finished(result)) => {
+                change_list.finish_staging()?;
+                if let Err(error) = result {
+                    error_to_display = Some(DisplayedError {
+                        kind: DisplayedErrorKind::StageError,
+                        error,
+                    });
+                } else if error_to_display
+                    .as_ref()
+                    .is_some_and(|error| matches!(error.kind, DisplayedErrorKind::StageError))
+                {
+                    error_to_display = None;
+                }
+                renderer.render(change_list, error_to_display.as_ref())?;
+            }
         }
     }
 }
@@ -125,10 +152,21 @@ fn handle_user_input<'a>(
     change_list: &mut ChangeList,
     mut renderer: FullscreenRenderer<'a>,
     fetch_signal_sender: Sender<Signal>,
+    event_sender: Sender<Event>,
     error_to_display: Option<&DisplayedError>,
     config: &Config,
 ) -> Result<Option<FullscreenRenderer<'a>>> {
     use crossterm::event::KeyCode::*;
+
+    if change_list.is_staging() {
+        let allowed = match renderer.mode {
+            RenderMode::ChangeList => matches!(event.code, Up | Down | Char('h') | Char('f')),
+            RenderMode::HelpScreen => matches!(event.code, Esc),
+        };
+        if !allowed {
+            return Ok(Some(renderer));
+        }
+    }
 
     match renderer.mode {
         RenderMode::ChangeList => match (event.code, event.modifiers) {
@@ -141,9 +179,18 @@ fn handle_user_input<'a>(
                 renderer.render(change_list, error_to_display)?;
             }
             (Char(' '), _) => {
-                change_list
-                    .stage_selected_change()
-                    .context("Failed to stage selected change")?;
+                if let Some(folder_path) = change_list.selected_new_folder() {
+                    change_list.begin_staging(folder_path.clone());
+                    spawn_stage_thread(
+                        change_list.repo_path(),
+                        StageScope::Folder(folder_path),
+                        event_sender,
+                    );
+                } else {
+                    change_list
+                        .stage_selected_change()
+                        .context("Failed to stage selected change")?;
+                }
 
                 renderer.render(change_list, error_to_display)?;
             }
@@ -155,9 +202,8 @@ fn handle_user_input<'a>(
                 renderer.render(change_list, error_to_display)?;
             }
             (Char('a'), _) => {
-                change_list
-                    .stage_all_changes()
-                    .context("Failed to stage all changes")?;
+                change_list.begin_all_staging();
+                spawn_stage_thread(change_list.repo_path(), StageScope::All, event_sender);
 
                 renderer.render(change_list, error_to_display)?;
             }
@@ -296,12 +342,14 @@ pub(crate) struct DisplayedError {
 
 pub(crate) enum DisplayedErrorKind {
     FetchError,
+    StageError,
 }
 
 impl DisplayedErrorKind {
     pub fn title(&self) -> &'static str {
         match self {
             DisplayedErrorKind::FetchError => "Fetch error",
+            DisplayedErrorKind::StageError => "Staging error (written batches remain staged)",
         }
     }
 }

@@ -1,11 +1,12 @@
 use anyhow::{anyhow, bail, Context, Result};
-use git2::{Index, IndexAddOption, Repository, StatusOptions, Statuses, Tree};
+use git2::{Index, Repository, StatusOptions, Statuses, Tree};
+use std::{collections::HashSet, path::PathBuf};
 
 use crate::statuses::{Status, WORKTREE_STATUSES};
 
 use super::{
     branches::{get_current_branch, LocalBranch, UpstreamBranch, UpstreamCommitsDiff},
-    change::Change,
+    change::{bytes_to_path, Change},
     change_ordering::ChangeOrdering,
 };
 
@@ -17,6 +18,15 @@ pub(crate) struct ChangeList<'repo> {
     index: Index,
     pub current_branch: LocalBranch,
     pub upstream: Option<UpstreamBranch>,
+    staging: Option<Staging>,
+}
+
+struct Staging {
+    folder_path: Option<Vec<u8>>,
+    completed_paths: HashSet<Vec<u8>>,
+    pending: HashSet<Vec<u8>>,
+    completed: usize,
+    total: Option<usize>,
 }
 
 impl<'repo> ChangeList<'repo> {
@@ -39,6 +49,7 @@ impl<'repo> ChangeList<'repo> {
             index,
             current_branch,
             upstream,
+            staging: None,
         };
 
         change_list.populate_changes(statuses)?;
@@ -171,17 +182,127 @@ impl<'repo> ChangeList<'repo> {
         Ok(())
     }
 
-    pub fn stage_all_changes(&mut self) -> Result<()> {
+    pub fn selected_new_folder(&self) -> Option<Vec<u8>> {
+        let change = self.changes.get(self.index_of_selected_change)?;
+        if change.status != Status::NonConflicting(git2::Status::WT_NEW) {
+            return None;
+        }
+        let workdir = self.repo.workdir()?;
+        let file_type = std::fs::symlink_metadata(workdir.join(bytes_to_path(&change.path)))
+            .ok()?
+            .file_type();
+        file_type.is_dir().then(|| change.path.clone())
+    }
+
+    pub fn repo_path(&self) -> PathBuf {
+        self.repo.path().to_path_buf()
+    }
+
+    pub fn begin_staging(&mut self, folder_path: Vec<u8>) {
+        self.staging = Some(Staging {
+            folder_path: Some(folder_path),
+            pending: HashSet::new(),
+            completed_paths: HashSet::new(),
+            completed: 0,
+            total: None,
+        });
+    }
+
+    pub fn begin_all_staging(&mut self) {
+        self.staging = Some(Staging {
+            folder_path: None,
+            pending: HashSet::new(),
+            completed_paths: HashSet::new(),
+            completed: 0,
+            total: None,
+        });
+    }
+
+    pub fn expand_staging_paths(&mut self, mut paths: Vec<Vec<u8>>) {
+        let Some(staging) = &mut self.staging else {
+            return;
+        };
+        paths.sort();
+        staging.total = Some(paths.len());
+        staging.pending.extend(paths.iter().cloned());
+        let selected_folder = staging.folder_path.clone();
+        let workdir = self.repo.workdir();
+        let mut expanded = Vec::with_capacity(self.changes.len().max(paths.len()));
+        for change in self.changes.drain(..) {
+            let is_new_folder = change.status == Status::NonConflicting(git2::Status::WT_NEW)
+                && workdir.is_some_and(|workdir| {
+                    std::fs::symlink_metadata(workdir.join(bytes_to_path(&change.path)))
+                        .is_ok_and(|metadata| metadata.file_type().is_dir())
+                });
+            let should_expand = is_new_folder
+                && selected_folder
+                    .as_ref()
+                    .is_none_or(|folder| *folder == change.path);
+            if should_expand {
+                let mut prefix = change.path.clone();
+                if !prefix.ends_with(b"/") {
+                    prefix.push(b'/');
+                }
+                let start = paths.partition_point(|path| path < &prefix);
+                let folder_paths: Vec<_> = paths[start..]
+                    .iter()
+                    .take_while(|path| path.starts_with(&prefix))
+                    .collect();
+                if !folder_paths.is_empty() {
+                    expanded.extend(folder_paths.into_iter().map(|path| Change {
+                        path: path.clone(),
+                        status: Status::NonConflicting(git2::Status::WT_NEW),
+                    }));
+                    continue;
+                }
+            }
+            expanded.push(change);
+        }
+        self.changes = expanded;
+        self.ordering.remember_current_order(&self.changes);
+    }
+
+    pub fn complete_staging_batch(&mut self, paths: Vec<Vec<u8>>) {
+        let Some(staging) = &mut self.staging else {
+            return;
+        };
+        for path in paths {
+            if staging.pending.remove(&path) {
+                staging.completed += 1;
+                staging.completed_paths.insert(path);
+            }
+        }
+    }
+
+    pub fn finish_staging(&mut self) -> Result<()> {
         self.index
-            .add_all(["*"], IndexAddOption::DEFAULT, None)
-            .context("Failed to add all changes to Git index")?;
-
-        self.index.write().context("Failed to write to Git index")?;
-
+            .read(true)
+            .context("Failed to reload Git index")?;
+        self.staging = None;
         self.refresh_changes()
-            .context("Failed to refresh changes after staging")?;
+            .context("Failed to refresh changes after staging")
+    }
 
-        Ok(())
+    pub fn is_staging(&self) -> bool {
+        self.staging.is_some()
+    }
+
+    pub fn is_pending_stage(&self, path: &[u8]) -> bool {
+        self.staging
+            .as_ref()
+            .is_some_and(|staging| staging.pending.contains(path))
+    }
+
+    pub fn is_completed_stage(&self, path: &[u8]) -> bool {
+        self.staging
+            .as_ref()
+            .is_some_and(|staging| staging.completed_paths.contains(path))
+    }
+
+    pub fn stage_progress(&self) -> Option<(usize, Option<usize>)> {
+        self.staging
+            .as_ref()
+            .map(|staging| (staging.completed, staging.total))
     }
 
     pub fn unstage_selected_change(&mut self) -> Result<()> {

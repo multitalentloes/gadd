@@ -13,6 +13,7 @@ mod config;
 mod event_loop;
 mod fetch;
 mod rendering;
+mod staging;
 mod statuses;
 
 /// Command-line utility for staging changes to Git (alternative to git-add's interactive mode).
